@@ -1,7 +1,12 @@
-use std::{fs::File, io::Read};
+use std::{
+    fs::File,
+    io::Read,
+    time::{Duration, SystemTime},
+};
 
 use pixels::{Pixels, SurfaceTexture};
 use rand::Rng;
+use rodio::{source::SineWave, OutputStream, Sink, Source};
 use winit::{
     dpi::LogicalSize,
     event::{Event, VirtualKeyCode},
@@ -22,7 +27,12 @@ struct CPU {
     display: [u8; WIDTH as usize * HEIGHT as usize],
     stack: Vec<u16>,
     delay_timer: u8,
-    delay_timer_delta: f32,
+    delay_timer_timestamp: SystemTime,
+    sound_timer: u8,
+    sound_timer_timestamp: SystemTime,
+    play_sound: bool,
+    key_pressed: Option<u8>,
+    key_released: Option<u8>,
 }
 
 impl CPU {
@@ -35,20 +45,33 @@ impl CPU {
             pc: 0,
             pointer: 0,
             delay_timer: 0,
-            delay_timer_delta: 0.0,
+            delay_timer_timestamp: SystemTime::now(),
+            sound_timer: 0,
+            sound_timer_timestamp: SystemTime::now(),
+            play_sound: false,
+            key_pressed: None,
+            key_released: None,
         }
     }
 
-    fn update_delay_timer(&mut self, delta_in_nanoseconds: f32) {
-        self.delay_timer_delta += delta_in_nanoseconds;
+    fn update_sound_timer(&mut self) {
+        if self.sound_timer_timestamp.elapsed().unwrap().as_millis()
+            >= ((1.0 / (FREQUENCY as f32 * 0.12)) * 1000.0) as u128
+        {
+            self.sound_timer_timestamp = SystemTime::now();
+            self.sound_timer = self.sound_timer.saturating_sub(1);
+        }
 
-        let delay_timer_delta = self.delay_timer_delta / 1000000.0;
+        if !self.play_sound && self.sound_timer > 0 {
+            self.play_sound = true;
+        }
+    }
 
-        // The original hardware runs at approx 500Hz and the delay timer updates at 60
-        // which is 12% of the frequency. This allows consistency when adjusting the
-        // clock
-        if delay_timer_delta >= (1.0 / (FREQUENCY as f32 * 0.12)) + 1000.0 {
-            self.delay_timer_delta = 0.0;
+    fn update_delay_timer(&mut self) {
+        if self.delay_timer_timestamp.elapsed().unwrap().as_millis()
+            >= ((1.0 / (FREQUENCY as f32 * 0.12)) * 1000.0) as u128
+        {
+            self.delay_timer_timestamp = SystemTime::now();
             self.delay_timer = self.delay_timer.saturating_sub(1);
         }
     }
@@ -73,7 +96,10 @@ impl CPU {
 
     fn cycle(&mut self) {
         let memory_opcode = self.read_memory_opcode();
+
         self.pc += 2;
+
+        // println!("Opcode: {:#X}", memory_opcode);
 
         match self.decompose_opcode(memory_opcode) {
             (0, 0, 0xE, 0) => self.clear_display(),
@@ -99,20 +125,59 @@ impl CPU {
             (0xB, n1, n2, n3) => self.jump_to_address_plus_v0(n1, n2, n3),
             (0xC, x, n1, n2) => self.set_register_x_rand_and_value(x, n1, n2),
             (0xD, x, y, n) => self.draw_sprite(x, y, n),
-            // (0xE, x, 9, 0xE) => self.skip_if_key_pressed(x),
-            // (0xE, x, 0xA, 1) => self.skip_if_key_not_pressed(x),
+            (0xE, x, 9, 0xE) => self.skip_if_key_pressed(x),
+            (0xE, x, 0xA, 1) => self.skip_if_key_not_pressed(x),
             (0xF, x, 0, 7) => self.set_register_x_to_delay_timer(x),
-            // (0xF, x, 0, 0xA) => self.wait_for_key_press(x),
+            (0xF, x, 0, 0xA) => self.wait_for_key_press(x),
             (0xF, x, 1, 5) => self.set_delay_timer_to_register_x(x),
-            // (0xF, x, 1, 8) => self.set_sound_timer_to_register_x(x),
+            (0xF, x, 1, 8) => self.set_sound_timer_to_register_x(x),
             (0xF, x, 1, 0xE) => self.add_register_x_to_pointer(x),
             (0xF, x, 2, 9) => self.set_pointer_to_sprite(x),
-            // (0xF, x, 3, 3) => self.store_bcd_in_memory(x),
+            (0xF, x, 3, 3) => self.store_bcd_in_memory(x),
             (0xF, x, 5, 5) => self.store_registers_in_memory(x),
             (0xF, x, 6, 5) => self.fills_memory_from_registers(x),
             (0, 0, 0, 0) => panic!("Done"),
-            // _ => todo!("Unknown instruction {:04X}", memory_opcode),
-            _ => self.pc += 4,
+            _ => todo!("Unknown instruction {:04X}", memory_opcode),
+        }
+
+        self.update_delay_timer();
+        self.update_sound_timer();
+    }
+
+    fn store_bcd_in_memory(&mut self, register_x: u8) {
+        let reg_value = self.registers[register_x as usize];
+
+        let mut bcd: [u8; 3] = [0, 0, reg_value % 10];
+
+        for (div, i) in [100, 10].iter().zip([0, 1]) {
+            bcd[i] = ((reg_value - reg_value % div) / div) % div;
+        }
+
+        self.memory[self.pointer as usize..self.pointer as usize + 3].copy_from_slice(&bcd);
+    }
+
+    fn skip_if_key_pressed(&mut self, register_x: u8) {
+        let expected_key = self.registers[register_x as usize];
+
+        if self.key_pressed == Some(expected_key) {
+            self.pc += 2;
+        }
+    }
+
+    fn skip_if_key_not_pressed(&mut self, register_x: u8) {
+        let expected_key = self.registers[register_x as usize];
+
+        if self.key_pressed != Some(expected_key) {
+            self.pc += 2;
+        }
+    }
+
+    fn wait_for_key_press(&mut self, register_x: u8) {
+        match self.key_pressed {
+            Some(key) => {
+                self.registers[register_x as usize] = key;
+            }
+            None => self.pc -= 2,
         }
     }
 
@@ -143,6 +208,10 @@ impl CPU {
 
     fn set_delay_timer_to_register_x(&mut self, register: u8) {
         self.delay_timer = self.registers[register as usize];
+    }
+
+    fn set_sound_timer_to_register_x(&mut self, register: u8) {
+        self.sound_timer = self.registers[register as usize];
     }
 
     fn set_pointer_to_sprite(&mut self, register: u8) {
@@ -305,19 +374,6 @@ impl CPU {
         }
     }
 
-    fn set_opcode_at(&mut self, memory_position: u8, opcode: u16) {
-        self.memory[memory_position as usize] = (opcode >> 8) as u8;
-        self.memory[memory_position as usize + 1] = (opcode & 0xff) as u8;
-    }
-
-    fn print_registers(&self) {
-        println!("Registers:");
-
-        for (i, register) in self.registers.iter().enumerate() {
-            println!("V{:X}: 0x{:02X}", i, register);
-        }
-    }
-
     fn pretty_print_memory(&self) {
         for (i, byte) in self.memory.iter().enumerate() {
             if i % 16 == 0 {
@@ -331,22 +387,19 @@ impl CPU {
         println!("");
     }
 
-    fn print_display(&self) {
-        for (i, pixel) in self.display.iter().enumerate() {
-            if i % WIDTH as usize == 0 {
-                println!("");
-            }
-
-            print!("{}", pixel);
-        }
-
-        println!("");
-    }
-
     fn load_rom(&mut self, rom: Vec<u8>) {
         for (i, byte) in rom.iter().enumerate() {
             self.memory[i + 0x200] = *byte;
         }
+    }
+
+    fn set_key_pressed(&mut self, key: u8) {
+        self.key_pressed = Some(key);
+    }
+
+    fn set_key_released(&mut self, key: u8) {
+        self.key_pressed = None;
+        self.key_released = Some(key);
     }
 }
 
@@ -392,7 +445,7 @@ fn read_file(path: &str) -> Vec<u8> {
 }
 
 fn main() {
-    let rom_data = read_file("roms/particles.ch8");
+    let rom_data = read_file("roms/airplane.ch8");
 
     let event_loop = EventLoop::new();
     let mut input = WinitInputHelper::new();
@@ -411,16 +464,37 @@ fn main() {
 
     let mut pixels = {
         let window_size = window.inner_size();
-        let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
+        let surface_texture =
+            SurfaceTexture::new(window_size.width * 3, window_size.height * 3, &window);
         Pixels::new(WIDTH as u32, HEIGHT as u32, surface_texture).unwrap()
     };
+
+    let (_stream, stream_handle) = OutputStream::try_default().unwrap();
+    let sink = Sink::try_new(&stream_handle).unwrap();
+    sink.append(
+        SineWave::new(440.0)
+            .take_duration(Duration::from_secs_f32(10.0))
+            .repeat_infinite(),
+    );
+    sink.pause();
+
+    // Add a dummy source of the sake of the example.
 
     let mut chip8 = Chip8::new();
 
     chip8.start(rom_data);
-    chip8.cpu.pretty_print_memory();
 
-    let mut fps = fps_clock::FpsClock::new(FREQUENCY as u32);
+    let keypad_mapping = [
+        (VirtualKeyCode::Key1, 0x1),
+        (VirtualKeyCode::Key2, 0x2),
+        (VirtualKeyCode::Key3, 0x3),
+        (VirtualKeyCode::Key4, 0x4),
+        (VirtualKeyCode::Key5, 0x5),
+        (VirtualKeyCode::Key6, 0x6),
+        (VirtualKeyCode::Key7, 0x7),
+        (VirtualKeyCode::Key8, 0x8),
+        (VirtualKeyCode::Key9, 0x9),
+    ];
 
     event_loop.run(move |event, _, control_flow| {
         if let Event::RedrawRequested(_) = event {
@@ -434,14 +508,26 @@ fn main() {
                 *control_flow = ControlFlow::Exit;
                 return;
             }
+
+            for (key, value) in keypad_mapping {
+                if input.key_pressed(key) {
+                    chip8.cpu.set_key_pressed(value);
+                }
+
+                if input.key_released(key) {
+                    chip8.cpu.set_key_released(value);
+                }
+            }
         }
 
         chip8.cpu.cycle();
 
+        if chip8.cpu.sound_timer > 0 {
+            sink.play();
+        } else {
+            sink.pause();
+        }
+
         window.request_redraw();
-
-        let nanoseconds = fps.tick();
-
-        chip8.cpu.update_delay_timer(nanoseconds);
     });
 }
